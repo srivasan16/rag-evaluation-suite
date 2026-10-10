@@ -1,10 +1,26 @@
 import os
+import time
+import logging
 from pathlib import Path
 
 import chromadb
+from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
 
+load_dotenv()
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # PROJECT CONFIGURATION
@@ -16,12 +32,12 @@ CHROMA_PATH = PROJECT_ROOT / "data" / "chroma_db"
 
 COLLECTION_NAME = "paragraph_chunks"
 
-MODEL_NAME = "gemini-3.5-flash"
-TOP_K = 3
+MODEL_NAME = "gemini-3.8-flash"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-
+TOP_K = 15
 # ============================================================
-# GEMINI API CONFIGURATION
+# GEMINI
 # ============================================================
 
 api_key = os.getenv("GEMINI_API_KEY")
@@ -29,93 +45,81 @@ api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise RuntimeError(
         "GEMINI_API_KEY not found.\n"
-        "Set it in PowerShell before running the program."
+        "Please set your Gemini API key."
     )
 
 client = genai.Client(api_key=api_key)
 
+embedding_model = SentenceTransformer(
+    EMBEDDING_MODEL
+)
 
 # ============================================================
-# CHROMADB CONFIGURATION
+# CHROMADB
 # ============================================================
 
 chroma_client = chromadb.PersistentClient(
     path=str(CHROMA_PATH)
 )
 
-try:
-    collection = chroma_client.get_collection(
-        COLLECTION_NAME
-    )
-except Exception as e:
-    raise RuntimeError(
-        f"Could not find ChromaDB collection '{COLLECTION_NAME}'.\n"
-        f"Make sure Step 4 was completed successfully.\n\n"
-        f"Original error: {e}"
-    )
-
+collection = chroma_client.get_collection(
+    COLLECTION_NAME
+)
 
 # ============================================================
 # RETRIEVAL
 # ============================================================
 
 def retrieve_chunks(question, top_k=TOP_K):
-    """
-    Retrieve the most relevant chunks from ChromaDB.
-    """
+    
+    query_embedding = embedding_model.encode(
+        [question],
+        normalize_embeddings=True
+    ).tolist()[0]
 
     results = collection.query(
-        query_texts=[question],
-        n_results=top_k
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=[
+            "documents",
+            "metadatas",
+            "distances"
+        ]
     )
 
     documents = results["documents"][0]
+    logger.info(f"Retrieved Chunks: {len(documents)}")
     metadatas = results["metadatas"][0]
     distances = results["distances"][0]
 
     return documents, metadatas, distances
-
-
 # ============================================================
 # BUILD CONTEXT
 # ============================================================
 
 def build_context(documents, metadatas):
-    """
-    Convert retrieved chunks into a source-grounded context.
-    """
 
-    context_parts = []
+    parts = []
 
-    for i, (document, metadata) in enumerate(
+    for i, (doc, meta) in enumerate(
         zip(documents, metadatas),
         start=1
     ):
 
-        document_name = metadata.get(
-            "document",
-            "Unknown document"
-        )
-
-        page_number = metadata.get(
-            "page",
-            "Unknown page"
-        )
-
-        context_parts.append(
+        parts.append(
             f"""
-SOURCE {i}
+            SOURCE {i}
 
-Document: {document_name}
-Page: {page_number}
+            Document: {meta.get("document")}
 
-Passage:
-{document}
-"""
+            Page: {meta.get("page")}
+
+            Passage:
+            {doc}
+            """
         )
 
-    return "\n".join(context_parts)
-
+    return "\n".join(parts)
 
 # ============================================================
 # GENERATE ANSWER
@@ -123,148 +127,176 @@ Passage:
 
 def generate_answer(question):
 
-    # --------------------------------------------------------
-    # Step 1: Retrieve relevant chunks
-    # --------------------------------------------------------
+    documents, metadatas, distances = retrieve_chunks(
+        question,
+        TOP_K
+    )
+
+    logger.info("\n========== RETRIEVED DOCUMENTS ==========")
+
+    for i, (doc, meta, distance) in enumerate(
+        zip(documents, metadatas, distances),
+        start=1
+    ):
+        logger.info(f"\nChunk {i}")
+        logger.info(f"Document : {meta.get('document')}")
+        logger.info(f"Page     : {meta.get('page')}")
+        logger.info(f"Distance : {distance:.4f}")
+        logger.info(doc)
+
+
+
+    logger.info("\n=========================================")
+
+    if len(documents) == 0:
+        return "I don't know based on the provided documents."
+
+    context = build_context(
+        documents,
+        metadatas
+    )
+    logger.info("=" * 60)
+    logger.info(f"Context Size: {len(context)}")
+    logger.info("=" * 60)
+
+    prompt = f"""
+You are an intelligent Government Report Question Answering Assistant.
+
+You MUST answer using ONLY the retrieved evidence.
+
+Rules:
+
+1. Read ALL retrieved passages carefully.
+
+2. If the answer appears in ANY passage,
+   answer it.
+
+3. Combine multiple passages when needed.
+
+4. Never use outside knowledge.
+
+5. Never invent facts.
+
+6. Quote important facts from the evidence.
+
+7. Mention the document name and page number.
+
+8. Only answer
+
+I don't know based on the provided documents.
+
+when absolutely no retrieved passage contains the answer.
+
+Retrieved Evidence:
+
+{context}
+
+Question:
+
+{question}
+
+Answer:
+"""
+    response = None
+
+    for attempt in range(3):
+
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=500,
+                ),
+            )
+
+            if getattr(response, "text", None):
+                return response.text.strip()
+
+            break
+
+        except Exception as e:
+
+            error = str(e)
+
+            logger.error(f"Attempt {attempt+1} failed")
+            logger.error(error)
+
+            if "429" in error or "RESOURCE_EXHAUSTED" in error:
+                return (
+                    "Gemini API daily quota exceeded.\n"
+                    "Please wait until tomorrow or use another API key."
+                )
+
+            time.sleep(2 ** attempt)
+
+    # ---------- OUTSIDE THE LOOP ----------
+
+    if response is None:
+        return "Gemini API temporarily unavailable."
+
+    if getattr(response, "text", None):
+        return response.text.strip()
+
+    return "I don't know based on the provided documents."
+
+# ============================================================
+# RAG RESPONSE
+# ============================================================
+
+def get_rag_response(question):
 
     documents, metadatas, distances = retrieve_chunks(
         question,
         TOP_K
     )
 
-    # --------------------------------------------------------
-    # Step 2: Check whether anything was retrieved
-    # --------------------------------------------------------
+    answer = generate_answer(question)
 
-    if not documents:
-        return (
-            "I don't know based on the provided documents."
-        )
-
-    # --------------------------------------------------------
-    # Step 3: Build context
-    # --------------------------------------------------------
-
-    context = build_context(
-        documents,
-        metadatas
-    )
-
-    # --------------------------------------------------------
-    # Step 4: Create strict grounding prompt
-    # --------------------------------------------------------
-
-    prompt = f"""
-You are a document question-answering assistant.
-
-Your job is to answer the user's question ONLY using
-the retrieved passages provided below.
-
-IMPORTANT RULES:
-
-1. Do NOT use outside knowledge.
-2. Do NOT make up facts.
-3. If the retrieved passages do not contain enough
-   information to answer the question, respond exactly:
-
-I don't know based on the provided documents.
-
-4. Keep the answer concise and clear.
-5. Every factual answer MUST include a citation.
-6. The citation must contain:
-   - Document name
-   - Page number
-7. Include the most relevant evidence passage.
-8. Do not cite information that is not present in
-   the retrieved passages.
-
-USER QUESTION:
-{question}
-
-RETRIEVED SOURCES:
-{context}
-
-REQUIRED ANSWER FORMAT:
-
-Answer:
-<concise answer>
-
-Source:
-<Document name>, Page <page number>
-
-Evidence:
-<short relevant passage from the retrieved source>
-"""
-
-    # --------------------------------------------------------
-    # Step 5: Call Gemini
-    # --------------------------------------------------------
-
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                disable=True
-            )
-        )
-    )
-
-    # --------------------------------------------------------
-    # Step 6: Return generated answer
-    # --------------------------------------------------------
-
-    if not response.text:
-        return (
-            "I don't know based on the provided documents."
-        )
-
-    return response.text
-
+    return {
+        "question": question,
+        "answer": answer,
+        "contexts": documents,
+        "metadata": metadatas,
+    }
 
 # ============================================================
-# MAIN PROGRAM
+# MAIN
 # ============================================================
+
+def main():
+
+    logger.info("=" * 70)
+    logger.info("Government Report Intelligence - Document Q&A")
+    logger.info("=" * 70)
+
+    logger.info(f"\nVector Database : {CHROMA_PATH}")
+    logger.info(f"Collection      : {COLLECTION_NAME}")
+    logger.info(f"Model           : {MODEL_NAME}")
+    logger.info(f"Top-K           : {TOP_K}")
+
+    logger.info("\nSystem Ready!")
+
+    while True:
+
+        question = input(
+            "\nEnter your question (or type 'exit'): "
+        ).strip()
+
+        if question.lower() == "exit":
+            break
+
+        if not question:
+            continue
+
+        answer = generate_answer(question)
+
+        logger.info("\n" + "=" * 70)
+        logger.info("ANSWER")
+        logger.info("=" * 70)
+        logger.info(answer)
+        logger.info("=" * 70)
 
 if __name__ == "__main__":
-
-    print("=" * 70)
-    print("Government Report Intelligence - Document Q&A")
-    print("=" * 70)
-
-    print(f"\nVector database : {CHROMA_PATH}")
-    print(f"Collection      : {COLLECTION_NAME}")
-    print(f"Model           : {MODEL_NAME}")
-    print(f"Top-K           : {TOP_K}")
-
-    print("\nSystem ready.")
-
-    question = input(
-        "\nEnter your question: "
-    ).strip()
-
-    if not question:
-        print(
-            "\nI don't know based on the provided documents."
-        )
-
-    else:
-
-        try:
-
-            answer = generate_answer(question)
-
-            print("\n" + "=" * 70)
-            print("ANSWER")
-            print("=" * 70)
-
-            print(answer)
-
-            print("=" * 70)
-
-        except Exception as e:
-
-            print("\nERROR")
-            print("=" * 70)
-            print(str(e))
-            print("=" * 70)
+    main()
